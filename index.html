@@ -1563,6 +1563,7 @@ where not exists (select 1 from produtos p where lower(p.nome) = lower(v.nome));
 const CONFIG = {
   SUPABASE_URL: "https://xyfjiloxpsthlyafrhst.supabase.co",   // ex.: "https://abcdefghijk.supabase.co"
   SUPABASE_KEY: "sb_publishable_2jbO8b7v3T5uwk9waZXopA_roPRNplr",   // chave "publishable" (sb_publishable_...) ou a "anon"
+  ENDERECO_SITE: "https://parada-pedidos.pages.dev",  // endereço público do sistema, usado nos links do WhatsApp (ex.: "https://parada-pedidos.pages.dev")
   EMPRESA: "Fábrica Parada Ibiraçu",
 };
 
@@ -2064,7 +2065,12 @@ function progressoSetores(p){
     return {setor:st, feito, quem};
   });
 }
-const linkAcesso = token => `${location.origin}${location.pathname}?acesso=${token}`;
+function baseSite(){
+  const fixo = (CONFIG.ENDERECO_SITE || '').trim().replace(/\/+$/, '');
+  if (fixo) return fixo + '/';
+  return location.protocol.startsWith('http') ? location.origin + location.pathname : location.href.split(/[?#]/)[0];
+}
+const linkAcesso = token => `${baseSite()}?acesso=${token}`;
 
 /* ---------------- ícones ---------------- */
 const ICON = {
