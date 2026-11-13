@@ -234,6 +234,19 @@ input.qtd.vazio{background:var(--sun-soft)}
 .resumo-n{font-family:var(--font-display);font-weight:800;font-size:1.1rem}
 .resumo-n small{font-family:var(--font-body);color:var(--muted);font-weight:700;font-size:.85rem;display:block}
 .rodape-botoes{display:flex;gap:8px;flex-wrap:wrap}
+.esp-dados{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 16px;margin:0}
+.esp-dados dt{font-size:.8rem;color:var(--muted);font-weight:700}
+.esp-dados dd{margin:0;font-weight:800}
+.esp-lista{list-style:none;margin:0;padding:0}
+.esp-lista li{display:grid;grid-template-columns:1fr auto auto;gap:4px 12px;align-items:baseline;padding:9px 0;border-top:1px solid var(--line)}
+.esp-lista li:first-child{border-top:0}
+.esp-nome{font-weight:700}
+.esp-nome small{display:block;color:var(--muted);font-weight:600;font-size:.8rem}
+.esp-qtd{font-weight:800;white-space:nowrap;text-align:right}
+.esp-val{white-space:nowrap;text-align:right;min-width:80px}
+.esp-sub{text-align:right;border-top:2px solid var(--line);padding-top:8px;margin:0}
+.espelho .rodape-botoes{flex-wrap:nowrap}
+@media (max-width:640px){.espelho .rodape-botoes{flex:1 1 100%}.espelho .rodape-botoes .btn-prim{flex:1}}
 .datas{display:flex;flex-wrap:wrap;gap:8px}
 .data-chip{border:1.5px solid var(--line);background:var(--surface);border-radius:10px;padding:8px 12px;cursor:pointer;display:flex;flex-direction:column;align-items:flex-start;min-width:92px;color:var(--ink)}
 .data-chip b{font-family:var(--font-display);font-size:1rem}
@@ -2651,6 +2664,7 @@ function vSolicitante(d){
   if (a.enviado){
     return h + `<section class="ok-envio" role="status"><h2>Pedido #${a.enviado.numero} ${a.enviado.editado ? 'alterado' : 'enviado'}</h2><p>Entrega: <b>${fmtDiaLongo(a.enviado.data)}</b>. A fábrica já está vendo. Você pode acompanhar em "Pedidos da loja".</p><div class="a-bt"><button class="btn btn-linha" data-a="accAba" data-aba="meus">Ver pedidos da loja</button><button class="btn btn-prim" data-a="solNovo">Fazer outro pedido</button></div></section>`;
   }
+  if (f.revisao) return h + vEspelho(d, f);
   const datas = proximasEntregas(d.loja.dias_entrega, d.hoje, 6);
   if (f.data && !datas.includes(f.data)) datas.unshift(f.data);
   const existente = !f.editId && d.pedidos.find(p => p.data_entrega === f.data && p.status !== 'cancelado');
@@ -2664,6 +2678,28 @@ function vSolicitante(d){
     <div class="rodape-fixo"><div id="novo-resumo">${vResumo(resumoQtds(d.produtos, f.qtd))}</div><div class="rodape-botoes"><button class="btn btn-prim" data-a="solEnviar">${f.editId ? 'Salvar alteração' : 'Enviar pedido'}</button></div></div>
   </section>`;
   return h;
+}
+function vEspelho(d, f){
+  const qtdDe = p => parseNum(f.qtd[p.id]) || 0, sub = p => qtdDe(p) * (+p.preco || 0);
+  const itens = d.produtos.filter(p => qtdDe(p) > 0).sort(porCatNome);
+  const total = itens.reduce((s, p) => s + sub(p), 0);
+  const blocos = ORDEM_SETOR.map(st => [st, itens.filter(p => setorDe(p) === st)]).filter(([, l]) => l.length);
+  return `<section class="pagina espelho">
+    <div class="painel">
+      <h2>Espelho do pedido${f.editId ? ` #${f.editNumero}` : ''}</h2>
+      <p class="dica">Confira os produtos e as quantidades. O pedido só vai para a fábrica quando você tocar em <b>${f.editId ? 'Confirmar alteração' : 'Confirmar pedido'}</b>.</p>
+      <dl class="esp-dados"><div><dt>Loja</dt><dd>${esc(d.loja.nome)}</dd></div><div><dt>Entrega</dt><dd>${fmtDiaLongo(f.data)}</dd></div><div><dt>Pedido por</dt><dd>${esc(d.pessoa.nome)}</dd></div></dl>
+    </div>
+    ${blocos.map(([st, l]) => `<div class="painel esp-setor">
+      <h3 class="setor-tit${st === 'industrializados' ? ' ind' : st === 'emporios' ? ' emp' : ''}">${SETORES[st]} <small class="sel-setor">${l.length} ${l.length === 1 ? 'item' : 'itens'}</small></h3>
+      <ul class="esp-lista">${l.map(p => `<li><span class="esp-nome">${esc(p.nome)}<small>${money(p.preco)} / ${esc(p.unidade)}</small></span><span class="esp-qtd">${qty(qtdDe(p))} ${esc(p.unidade)}</span><span class="esp-val">${money(sub(p))}</span></li>`).join('')}</ul>
+      <p class="esp-sub">Subtotal ${SETORES[st]}: <b>${money(l.reduce((s, p) => s + sub(p), 0))}</b></p>
+    </div>`).join('')}
+    ${(f.observacao || '').trim() ? `<div class="painel"><p><b>Observação:</b> ${esc(f.observacao)}</p></div>` : ''}
+    <p class="dica">Valores pelo preço de tabela. Se faltar algum produto, vale o que a fábrica separar.</p>
+    <div class="rodape-fixo"><div class="resumo-n">${itens.length} ${itens.length === 1 ? 'produto' : 'produtos'} · ${money(total)}<small>valor estimado; o final é o que a fábrica separar</small></div>
+      <div class="rodape-botoes"><button class="btn btn-linha" data-a="solVoltar"><span class="l-longa">Voltar e alterar</span><span class="l-curta">Alterar</span></button><button class="btn btn-prim" data-a="solConfirmar">${f.editId ? 'Confirmar alteração' : 'Confirmar pedido'}</button></div></div>
+  </section>`;
 }
 function vMeusPedidos(d){
   if (!d.pedidos.length) return '<p class="vazio">Nenhum pedido nos últimos 45 dias.</p>';
@@ -2936,7 +2972,7 @@ function abrirSeparacao(id){
   window.scrollTo(0, 0); render();
   if (!sp.nome){ const n = document.getElementById('sep-nome'); if (n) n.focus(); }
 }
-const formSol = () => ({data:'', qtd:{}, observacao:'', filtro:'', fs:{}, editId:null, editNumero:null});
+const formSol = () => ({data:'', qtd:{}, observacao:'', filtro:'', fs:{}, editId:null, editNumero:null, revisao:false});
 function abrirAcesso(token){
   S.acc = {token, dados:null, erro:'', aba:'pedir', form:formSol(), enviado:null, recebendo:null, sep:{aberto:null, qtd:{}, filtro:'', filtroItem:'', aba:'', nome:''}};
   S.vista = 'acesso';
@@ -3230,11 +3266,16 @@ const ACOES = {
     S.acc.form = {data:p.data_entrega, qtd, observacao:p.observacao || '', filtro:'', editId:p.id, editNumero:p.numero};
     S.acc.aba = 'pedir'; S.acc.enviado = null; window.scrollTo(0, 0); render();
   },
-  solEnviar: () => tentar(async () => {
+  solEnviar(){
     const a = S.acc, f = a.form, d = a.dados;
     if (!f.data){ toast('Escolha o dia da entrega.', 'erro'); return; }
+    if (!d.produtos.some(p => (parseNum(f.qtd[p.id]) || 0) > 0)){ toast('Coloque a quantidade de pelo menos um produto.', 'erro'); return; }
+    f.revisao = true; window.scrollTo(0, 0); render();
+  },
+  solVoltar(){ S.acc.form.revisao = false; window.scrollTo(0, 0); render(); },
+  solConfirmar: () => tentar(async () => {
+    const a = S.acc, f = a.form, d = a.dados;
     const itens = d.produtos.map(p => ({produto_id:p.id, qtd:parseNum(f.qtd[p.id]) || 0})).filter(i => i.qtd > 0);
-    if (!itens.length){ toast('Coloque a quantidade de pelo menos um produto.', 'erro'); return; }
     const r = await api.solicitanteEnviar(a.token, f.data, itens, f.observacao, f.editId);
     a.dados = r.painel; a.enviado = {numero:r.numero, data:f.data, editado:!!f.editId};
     a.form = formSol(); a.form.data = f.data; a.erro = '';
