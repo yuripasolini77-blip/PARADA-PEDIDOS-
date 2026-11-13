@@ -4,6 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Parada Pedidos</title>
+<meta name="theme-color" content="#BE1B22">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Parada Pedidos">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Nunito+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
@@ -95,6 +102,7 @@ button,input,select,textarea{font:inherit;color:inherit}
 .faixa-demo-in{max-width:1280px;margin:0 auto;padding:10px 16px;display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;font-size:.9rem}
 .faixa-demo-in p{flex:1 1 320px}
 .faixa-demo-in .grupo{display:flex;flex-wrap:wrap;gap:8px}
+.passos-app{margin:8px 0 16px;padding-left:22px;display:grid;gap:8px}
 
 .conteudo{max-width:1280px;margin:0 auto;padding:20px 16px 40px;display:flex;flex-direction:column;gap:20px}
 
@@ -2102,7 +2110,7 @@ function vFaixaDemo(){
 }
 function vEscritorio(){
   const telas = {entregas:vEntregas, novo:vNovo, relatorios:vRelatorios, cadastros:vCadastros, ajuda:vAjuda};
-  return `${vTopo()}${S.modo === 'demo' ? vFaixaDemo() : ''}<main class="conteudo">${(telas[S.tela] || vEntregas)()}</main>`;
+  return `${vTopo()}${S.modo === 'demo' ? vFaixaDemo() : vFaixaInstalar()}<main class="conteudo">${(telas[S.tela] || vEntregas)()}</main>`;
 }
 
 /* ---------------- tela: entregas do dia ---------------- */
@@ -2543,9 +2551,9 @@ function vFaixaDemoAcesso(){
 function vAcesso(){
   const a = S.acc, d = a && a.dados;
   const sub = d ? (d.funcao === 'entregador' ? 'Entregas' : d.funcao === 'separador' ? `Separação · ${d.pessoa.setor ? SETORES[d.pessoa.setor] : 'todos os setores'}` : d.loja.nome) : CONFIG.EMPRESA;
-  let h = `<div class="acesso">${S.demoPessoa ? vFaixaDemoAcesso() : ''}<header class="topo"><div class="topo-in">${vMarca(sub)}<button class="btn-topo" data-a="accAtualizar">Atualizar</button></div></header><main class="conteudo">`;
+  let h = `<div class="acesso">${S.demoPessoa ? vFaixaDemoAcesso() : ''}<header class="topo"><div class="topo-in">${vMarca(sub)}<button class="btn-topo" data-a="accAtualizar">Atualizar</button></div></header>${vFaixaInstalar()}<main class="conteudo">`;
   if (!d){
-    h += a && a.erro ? `<section class="painel"><h1>Não foi possível abrir</h1><p class="erro">${esc(a.erro)}</p><div><button class="btn btn-prim" data-a="accAtualizar">Tentar de novo</button></div></section>` : '<p class="vazio">Carregando…</p>';
+    h += a && a.erro ? `<section class="painel"><h1>Não foi possível abrir</h1><p class="erro">${esc(a.erro)}</p>${emApp() ? '<p class="dica">Se você recebeu um link novo, apague este ícone, abra o link novo pelo WhatsApp e instale o aplicativo de novo.</p>' : ''}<div><button class="btn btn-prim" data-a="accAtualizar">Tentar de novo</button></div></section>` : '<p class="vazio">Carregando…</p>';
     return h + '</main></div>';
   }
   if (a.erro) h += `<p class="erro" role="alert">${esc(a.erro)}</p>`;
@@ -2696,7 +2704,7 @@ function vSemPermissao(){
 function vModal(){
   const m = S.modal;
   if (!m) return '';
-  const fn = {nfe:vModalNfe, pedido:vModalPedido, entregar:vModalEntregar, confirmar:vModalConfirmar, imprimir:vModalImprimir, copiar:vModalCopiar, importar:vModalImportar}[m.tipo];
+  const fn = {instalar:vModalInstalar, nfe:vModalNfe, pedido:vModalPedido, entregar:vModalEntregar, confirmar:vModalConfirmar, imprimir:vModalImprimir, copiar:vModalCopiar, importar:vModalImportar}[m.tipo];
   return fn ? fn(m) : '';
 }
 function vModalPedido(m){
@@ -2984,6 +2992,11 @@ const pedidosParaImprimir = m => m.modo === 'separacao' ? m.pedidos.filter(p => 
 const ACOES = {
   ir: el => irPara(el.dataset.tela),
   sair(){ if (api.sair) api.sair(); S.vista = 'login'; S.login.erro = ''; S.modal = null; render(); },
+  async instalarApp(){
+    if (pedidoInstalar){ const p = pedidoInstalar; pedidoInstalar = null; try { p.prompt(); await p.userChoice; } catch(e) {} render(); return; }
+    S.modal = {tipo:'instalar'}; render();
+  },
+  instalarDepois(){ gravarLocal(CHAVE_SEM_FAIXA, '1'); render(); },
   dia: el => { S.data = addDays(S.data, +el.dataset.d); carregarDia(); },
   hoje(){ S.data = today(); carregarDia(); },
   recarregar: () => tentar(async () => { await carregarBase(); await carregarDia(); }),
@@ -3333,6 +3346,40 @@ setInterval(() => {
   else if (S.vista === 'acesso' && S.acc && S.acc.dados && !S.acc.recebendo && !S.acc.sep.aberto && !foco && (S.acc.dados.funcao !== 'solicitante' || S.acc.aba === 'meus')) carregarAcesso(true);
 }, 60000);
 
+/* ---------------- aplicativo (ícone na tela do celular) ---------------- */
+const CHAVE_ACESSO = 'parada_pedidos_acesso', CHAVE_SEM_FAIXA = 'parada_pedidos_sem_faixa_app';
+let pedidoInstalar = null;
+function lerLocal(k){ try { return localStorage.getItem(k); } catch(e) { return null; } }
+function gravarLocal(k, v){ try { localStorage.setItem(k, v); } catch(e) {} }
+function emApp(){
+  try { return matchMedia('(display-mode: standalone)').matches || matchMedia('(display-mode: fullscreen)').matches || navigator.standalone === true; }
+  catch(e) { return false; }
+}
+const eIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+function vFaixaInstalar(){
+  if (S.modo !== 'real' || emApp() || lerLocal(CHAVE_SEM_FAIXA)) return '';
+  if (!pedidoInstalar && !eIOS()) return '';
+  return `<div class="faixa-demo faixa-app"><div class="faixa-demo-in"><p><b>Use como aplicativo:</b> coloque o Parada Pedidos na tela do celular e abra com um toque.</p>
+    <div class="grupo"><button class="btn btn-sm btn-sun" data-a="instalarApp">Instalar</button><button class="btn btn-sm btn-linha" data-a="instalarDepois">Agora não</button></div></div></div>`;
+}
+function vModalInstalar(){
+  return `<div class="modal-fundo"><div class="modal estreito" role="dialog" aria-modal="true" aria-labelledby="mapp-tit">
+    <h2 id="mapp-tit">Colocar na tela do iPhone</h2>
+    <ol class="passos-app"><li>Abra este link no <b>Safari</b>.</li><li>Toque no botão <b>Compartilhar</b> (o quadrado com a seta para cima).</li><li>Toque em <b>Adicionar à Tela de Início</b> e depois em <b>Adicionar</b>.</li></ol>
+    <div class="rodape-botoes"><button class="btn btn-prim" data-a="fechar">Entendi</button></div></div></div>`;
+}
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); pedidoInstalar = e; if (S.vista) render(); });
+window.addEventListener('appinstalled', () => { pedidoInstalar = null; if (S.vista) render(); toast('Pronto! O Parada Pedidos está na tela do celular.'); });
+if ('serviceWorker' in navigator && location.protocol === 'https:' && CONFIG.SUPABASE_URL.trim()) navigator.serviceWorker.register('sw.js').catch(() => {});
+// O link de cada pessoa fica guardado: se o aplicativo abrir sem o link, usa o último que a pessoa abriu.
+function tokenDeAcesso(){
+  let daUrl = null;
+  try { daUrl = new URLSearchParams(location.search).get('acesso'); } catch(e) {}
+  if (daUrl){ gravarLocal(CHAVE_ACESSO, daUrl); return daUrl; }
+  const guardado = lerLocal(CHAVE_ACESSO);
+  return guardado && emApp() && !api.sessao() ? guardado : null;
+}
+
 /* ---------------- início ---------------- */
 async function entrarNoEscritorio(){
   if (S.modo === 'real'){
@@ -3350,8 +3397,7 @@ async function iniciar(){
   const configurado = CONFIG.SUPABASE_URL.trim() && CONFIG.SUPABASE_KEY.trim();
   api = configurado ? criarApiSupabase() : criarApiDemo();
   S.modo = api.modo;
-  let token = null;
-  try { token = new URLSearchParams(location.search).get('acesso'); } catch(e) {}
+  const token = tokenDeAcesso();
   if (token){ await abrirAcesso(token); return; }
   if (S.modo === 'real' && !api.sessao()){ S.vista = 'login'; render(); return; }
   try { await entrarNoEscritorio(); }
