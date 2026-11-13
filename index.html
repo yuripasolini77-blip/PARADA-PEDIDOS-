@@ -103,6 +103,18 @@ button,input,select,textarea{font:inherit;color:inherit}
 .faixa-demo-in p{flex:1 1 320px}
 .faixa-demo-in .grupo{display:flex;flex-wrap:wrap;gap:8px}
 .passos-app{margin:8px 0 16px;padding-left:22px;display:grid;gap:8px}
+.btn-sino{padding:6px 10px;display:inline-flex;align-items:center;justify-content:center;min-width:44px}
+.btn-sino svg,.avisos-cab svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;vertical-align:-4px}
+.btn-sino:not(.on){opacity:.75}
+#avisos-raiz .avisos-caixa{position:fixed;top:10px;left:50%;transform:translateX(-50%);width:min(460px,calc(100% - 20px));z-index:300;background:var(--sun-soft);color:var(--ink);border:2px solid var(--sun);border-radius:var(--radius);box-shadow:0 10px 28px rgba(0,0,0,.22);padding:12px 14px}
+.avisos-cab{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
+.avisos-caixa ul{list-style:none;margin:0;padding:0;display:grid;gap:8px;font-size:.92rem}
+.avisos-caixa li small{color:var(--muted);font-weight:700}
+.foto-campo .btn-foto{align-self:flex-start;display:inline-flex;align-items:center;gap:8px}
+.btn-foto svg,.presets .btn svg,.card-l1 svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linejoin:round;vertical-align:-3px}
+.foto-prev{display:flex;flex-direction:column;gap:8px}
+.foto-prev img{max-width:min(100%,280px);max-height:220px;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#fff}
+.foto-grande{display:block;width:100%;max-height:70vh;object-fit:contain;border-radius:10px;border:1px solid var(--line);background:#fff;margin:8px 0 12px}
 
 .conteudo{max-width:1280px;margin:0 auto;padding:20px 16px 40px;display:flex;flex-direction:column;gap:20px}
 
@@ -573,6 +585,21 @@ alter table lojas    add column if not exists codigo_parceiro text;
 alter table lojas    add column if not exists emite_nfe boolean not null default true;
 alter table produtos add column if not exists codigo_parceiro text;
 
+-- ---------- Fotos dos pedidos (separação de cada setor e folha assinada na entrega) ----------
+-- tipo: 'entrega' ou o setor separado (fabrica, industrializados, bebidas, emporios).
+-- A foto fica guardada aqui e só o escritório vê. Entrega: 90 dias. Separação: 45 dias.
+alter table pedidos add column if not exists fotos text[] not null default '{}';
+create table if not exists pedido_fotos (
+  pedido_id   uuid not null references pedidos(id) on delete cascade,
+  tipo        text not null,
+  foto        bytea not null,
+  enviado_por text,
+  enviado_em  timestamptz not null default now(),
+  primary key (pedido_id, tipo)
+);
+alter table pedido_fotos enable row level security;
+revoke all on pedido_fotos from anon, authenticated;
+
 create index if not exists pedidos_data_idx       on pedidos (data_entrega);
 create index if not exists pedidos_loja_idx       on pedidos (loja_id);
 create index if not exists pedidos_entregador_idx on pedidos (entregador_id);
@@ -787,8 +814,64 @@ end;
 $$;
 
 -- Entregador: 'sair' (pronto -> na rua) ou 'entregar' (com o nome de quem recebeu)
+-- Guarda uma foto do pedido (chamada só pelas funções do sistema).
+create or replace function guardar_foto(p_pedido uuid, p_tipo text, p_foto text, p_por text)
+returns void
+language plpgsql security definer set search_path = public as $$
+declare
+  v_b bytea;
+begin
+  if coalesce(p_foto, '') = '' then
+    return;
+  end if;
+  begin
+    v_b := decode(regexp_replace(p_foto, '^data:image/[a-zA-Z]+;base64,|\s', '', 'g'), 'base64');
+  exception when others then
+    raise exception 'A foto não pôde ser lida. Tire de novo.';
+  end;
+  if length(v_b) > 700000 then
+    raise exception 'A foto ficou grande demais. Tire de novo.';
+  end if;
+  if substring(v_b from 1 for 3) <> '\xffd8ff'::bytea then
+    raise exception 'A foto precisa ser JPG. Tire de novo.';
+  end if;
+  insert into pedido_fotos (pedido_id, tipo, foto, enviado_por)
+  values (p_pedido, p_tipo, v_b, nullif(trim(p_por), ''))
+  on conflict (pedido_id, tipo) do update
+    set foto = excluded.foto, enviado_por = excluded.enviado_por, enviado_em = now();
+
+  -- apaga as fotos antigas (entrega: 90 dias, separação: 45 dias)
+  delete from pedido_fotos
+   where enviado_em < now() - case when tipo = 'entrega' then interval '90 days' else interval '45 days' end;
+
+  update pedidos p
+     set fotos = x.lista
+    from (select pe.id,
+                 coalesce((select array_agg(f.tipo order by f.tipo) from pedido_fotos f where f.pedido_id = pe.id), '{}') as lista
+            from pedidos pe
+           where pe.id = p_pedido or cardinality(pe.fotos) > 0) x
+   where p.id = x.id and p.fotos is distinct from x.lista;
+end;
+$$;
+
+-- Escritório: abre uma foto do pedido.
+create or replace function foto_do_pedido(p_pedido uuid, p_tipo text)
+returns json
+language plpgsql security definer set search_path = public as $$
+begin
+  if not is_admin() then
+    raise exception 'Seu login não tem permissão para ver as fotos.';
+  end if;
+  return (select json_build_object(
+                   'foto', 'data:image/jpeg;base64,' || translate(encode(foto, 'base64'), E'\n', ''),
+                   'enviado_por', enviado_por, 'enviado_em', enviado_em)
+            from pedido_fotos where pedido_id = p_pedido and tipo = p_tipo);
+end;
+$$;
+
+drop function if exists entregador_atualizar(text, uuid, text, text);
 create or replace function entregador_atualizar(
-  p_token text, p_pedido uuid, p_acao text, p_recebido_por text default null
+  p_token text, p_pedido uuid, p_acao text, p_recebido_por text default null, p_foto text default null
 ) returns json
 language plpgsql security definer set search_path = public as $$
 declare
@@ -826,6 +909,7 @@ begin
            saiu_em = coalesce(saiu_em, now()),
            recebido_por = trim(p_recebido_por)
      where id = p_pedido;
+    perform guardar_foto(p_pedido, 'entrega', p_foto, v_p.nome);
 
   else
     raise exception 'Ação inválida.';
@@ -957,8 +1041,9 @@ $$;
 -- p_nome: nome de quem separou (obrigatório). p_setor: setor que está sendo separado.
 -- Quando todos os itens do pedido (de todos os setores) estão lançados, o pedido fica "pronto".
 drop function if exists separador_lancar(text, uuid, json);
+drop function if exists separador_lancar(text, uuid, json, text, text);
 create or replace function separador_lancar(
-  p_token text, p_pedido uuid, p_itens json, p_nome text, p_setor text default null
+  p_token text, p_pedido uuid, p_itens json, p_nome text, p_setor text default null, p_foto text default null
 ) returns json
 language plpgsql security definer set search_path = public as $$
 declare
@@ -1002,6 +1087,8 @@ begin
     raise exception 'Preencha a quantidade separada de todos os itens (coloque 0 no que não tinha).';
   end if;
 
+  perform guardar_foto(p_pedido, coalesce(v_setor, 'separacao'), p_foto, p_nome);
+
   if exists (select 1 from pedido_itens where pedido_id = p_pedido and qtd_atendida is null and qtd_pedida > 0) then
     update pedidos set status = 'separacao' where id = p_pedido and status = 'novo';
   else
@@ -1017,15 +1104,18 @@ $$;
 -- ---------- Quem pode chamar cada função ----------
 revoke all on function pessoa_do_link(text) from public, anon, authenticated;
 revoke all on function acesso_painel(text) from public;
-revoke all on function entregador_atualizar(text, uuid, text, text) from public;
+revoke all on function entregador_atualizar(text, uuid, text, text, text) from public;
+revoke all on function guardar_foto(uuid, text, text, text) from public, anon, authenticated;
+revoke all on function foto_do_pedido(uuid, text) from public, anon;
+grant execute on function foto_do_pedido(uuid, text) to authenticated;
 revoke all on function solicitante_enviar_pedido(text, date, json, text, uuid) from public;
 revoke all on function solicitante_cancelar_pedido(text, uuid) from public;
 revoke all on function separador_iniciar(text, uuid) from public;
-revoke all on function separador_lancar(text, uuid, json, text, text) from public;
+revoke all on function separador_lancar(text, uuid, json, text, text, text) from public;
 grant execute on function separador_iniciar(text, uuid) to anon, authenticated;
-grant execute on function separador_lancar(text, uuid, json, text, text) to anon, authenticated;
+grant execute on function separador_lancar(text, uuid, json, text, text, text) to anon, authenticated;
 grant execute on function acesso_painel(text) to anon, authenticated;
-grant execute on function entregador_atualizar(text, uuid, text, text) to anon, authenticated;
+grant execute on function entregador_atualizar(text, uuid, text, text, text) to anon, authenticated;
 grant execute on function solicitante_enviar_pedido(text, date, json, text, uuid) to anon, authenticated;
 grant execute on function solicitante_cancelar_pedido(text, uuid) to anon, authenticated;
 grant execute on function is_admin() to authenticated;
@@ -1818,6 +1908,12 @@ function criarApiDemo(){
   if (!db || !db.pessoas || !db.lojas) db = semearDemo();
   const gravar = () => ls.set(CHAVE, db);
   gravar();
+  const fotosDemo = {};
+  const guardarFotoDemo = (p, tipo, foto, por) => {
+    if (!foto) return;
+    (fotosDemo[p.id] = fotosDemo[p.id] || {})[tipo] = {foto, enviado_por:por, enviado_em:new Date().toISOString()};
+    p.fotos = [...new Set([...(p.fotos || []), tipo])].sort();
+  };
   const comItens = p => ({...clone(p), itens: db.itens.filter(i => i.pedido_id === p.id).sort((a,b) => a.ordem - b.ordem).map(clone)});
   const pessoaDoLink = token => {
     const p = db.pessoas.find(x => x.token === token && x.ativo);
@@ -1886,7 +1982,7 @@ function criarApiDemo(){
     async atualizarItens(lista){ lista.forEach(x => { const i = db.itens.find(y => y.id === x.id); if (i){ i.qtd_atendida = x.qtd_atendida; i.preco_unit = x.preco_unit; } }); gravar(); },
     async excluirPedido(id){ db.pedidos = db.pedidos.filter(p => p.id !== id); db.itens = db.itens.filter(i => i.pedido_id !== id); gravar(); },
     async acessoPainel(token){ await pausa(); return painel(token); },
-    async entregadorAtualizar(token, pid, acao, recebido){
+    async entregadorAtualizar(token, pid, acao, recebido, foto){
       await pausa();
       const pe = pessoaDoLink(token);
       if (pe.funcao !== 'entregador') throw new Error('Este link não é de entregador.');
@@ -1900,6 +1996,7 @@ function criarApiDemo(){
         if (!['pronto','em_rota'].includes(p.status)) throw new Error('Este pedido não pode ser marcado como entregue agora.');
         if (!String(recebido||'').trim()) throw new Error('Informe o nome de quem recebeu.');
         Object.assign(p, {status:'entregue', entregue_em:agora, saiu_em:p.saiu_em || agora, recebido_por:String(recebido).trim()});
+        guardarFotoDemo(p, 'entrega', foto, pe.nome);
       } else throw new Error('Ação inválida.');
       gravar(); return painel(token);
     },
@@ -1935,7 +2032,7 @@ function criarApiDemo(){
       else if (!['separacao','pronto'].includes(p.status)) throw new Error('Este pedido já saiu para entrega ou foi cancelado.');
       gravar(); return painel(token);
     },
-    async separadorLancar(token, pid, itens, nome, setor){
+    async separadorLancar(token, pid, itens, nome, setor, foto){
       await pausa();
       const pe = pessoaDoLink(token);
       if (pe.funcao !== 'separador') throw new Error('Este link não é de separador.');
@@ -1954,6 +2051,7 @@ function criarApiDemo(){
       db.itens = novos;
       if (doPedido.some(i => i.qtd_atendida == null && +i.qtd_pedida > 0)){ if (p.status === 'novo') p.status = 'separacao'; }
       else if (['novo','separacao'].includes(p.status)){ p.status = 'pronto'; p.separado_em = p.separado_em || new Date().toISOString(); }
+      guardarFotoDemo(p, stEf || 'separacao', foto, nome);
       gravar(); return painel(token);
     },
     async inserirVarios(tab, lista){ await pausa(); lista.forEach(o => db[tab].push({id:uid(), criado_em:new Date().toISOString(), ativo:true, ...clone(o)})); gravar(); },
@@ -1966,6 +2064,9 @@ function criarApiDemo(){
       p.status = 'cancelado'; gravar(); return painel(token);
     },
     restaurar(){ db = semearDemo(); gravar(); },
+    async fotoDoPedido(pid, tipo){ await pausa(); return (fotosDemo[pid] || {})[tipo] || null; },
+    async vigia(de){ await pausa(); return db.pedidos.filter(p => p.data_entrega >= de).map(p => ({...comItens(p), loja_nome:(db.lojas.find(l => l.id === p.loja_id) || {}).nome || ''})); },
+    async backupPedidos(){ await pausa(); return db.pedidos.slice().sort((a, b) => a.data_entrega.localeCompare(b.data_entrega) || a.numero - b.numero).map(comItens); },
   };
 }
 
@@ -2056,11 +2157,25 @@ function criarApiSupabase(){
     excluirPedido: id => http(`/rest/v1/pedidos?id=eq.${id}`, {method:'DELETE'}),
     async atualizarItens(lista){ for (const x of lista) await http(`/rest/v1/pedido_itens?id=eq.${x.id}`, {method:'PATCH', body:{qtd_atendida:x.qtd_atendida, preco_unit:x.preco_unit}}); },
     acessoPainel: token => rpc('acesso_painel', {p_token:token}, true),
-    entregadorAtualizar: (token, pid, acao, recebido) => rpc('entregador_atualizar', {p_token:token, p_pedido:pid, p_acao:acao, p_recebido_por:recebido || null}, true),
+    entregadorAtualizar: (token, pid, acao, recebido, foto) => rpc('entregador_atualizar', {p_token:token, p_pedido:pid, p_acao:acao, p_recebido_por:recebido || null, ...(foto ? {p_foto:foto} : {})}, true),
+    fotoDoPedido: (pid, tipo) => rpc('foto_do_pedido', {p_pedido:pid, p_tipo:tipo}),
+    async vigia(de){
+      const d = await http(`/rest/v1/pedidos?select=id,numero,status,loja_id,data_entrega,origem,recebido_por,loja:lojas(nome),itens:pedido_itens(produto_id,produto_nome,setor,qtd_pedida,qtd_atendida,separado_por)&data_entrega=gte.${de}&order=numero.asc`);
+      return (d || []).map(p => ({...p, loja_nome:(p.loja && p.loja.nome) || ''}));
+    },
+    async backupPedidos(aoAvancar){
+      const todos = [];
+      for (let off = 0; ; off += 250){
+        const d = ord(await http(`/rest/v1/pedidos?${SEL}&order=data_entrega.asc,numero.asc&limit=250&offset=${off}`));
+        todos.push(...d); if (aoAvancar) aoAvancar(todos.length);
+        if (d.length < 250) break;
+      }
+      return todos;
+    },
     solicitanteEnviar: (token, data, itens, obs, pedidoId) => rpc('solicitante_enviar_pedido', {p_token:token, p_data:data, p_itens:itens, p_observacao:obs || null, p_pedido:pedidoId || null}, true),
     solicitanteCancelar: (token, pid) => rpc('solicitante_cancelar_pedido', {p_token:token, p_pedido:pid}, true),
     separadorIniciar: (token, pid) => rpc('separador_iniciar', {p_token:token, p_pedido:pid}, true),
-    separadorLancar: (token, pid, itens, nome, setor) => rpc('separador_lancar', {p_token:token, p_pedido:pid, p_itens:itens, p_nome:nome, p_setor:setor || null}, true),
+    separadorLancar: (token, pid, itens, nome, setor, foto) => rpc('separador_lancar', {p_token:token, p_pedido:pid, p_itens:itens, p_nome:nome, p_setor:setor || null, ...(foto ? {p_foto:foto} : {})}, true),
     inserirVarios: (tab, lista) => http(`/rest/v1/${tab}`, {method:'POST', body:lista}),
   };
 }
@@ -2117,7 +2232,7 @@ function vTopo(){
   const abas = [['entregas','Entregas','Entregas'],['novo','Novo pedido','Novo'],['relatorios','Relatórios','Relatórios'],['cadastros','Cadastros','Cadastros']];
   if (S.modo === 'demo') abas.push(['ajuda','Colocar no ar','No ar']);
   return `<header class="topo"><div class="topo-in">${vMarca(CONFIG.EMPRESA)}
-    <div class="topo-dir">${S.modo === 'demo' ? '<span class="selo">Versão de teste</span>' : `<span class="quem">${esc((api.sessao()||{}).email || '')}</span><button class="btn-topo" data-a="sair">Sair</button>`}</div>
+    <div class="topo-dir">${vSino()}${S.modo === 'demo' ? '<span class="selo">Versão de teste</span>' : `<span class="quem">${esc((api.sessao()||{}).email || '')}</span><button class="btn-topo" data-a="sair">Sair</button>`}</div>
   </div></header>
   <nav class="abas" aria-label="Seções"><div class="abas-in">${abas.map(([t, l, c]) => `<button class="aba${S.tela === t ? ' ativa' : ''}" data-a="ir" data-tela="${t}"${S.tela === t ? ' aria-current="page"' : ''}><span class="ico">${ICON[t]}</span><span class="l-longa">${l}</span><span class="l-curta">${c}</span></button>`).join('')}</div></nav>`;
 }
@@ -2129,7 +2244,7 @@ function vFaixaDemo(){
 }
 function vEscritorio(){
   const telas = {entregas:vEntregas, novo:vNovo, relatorios:vRelatorios, cadastros:vCadastros, ajuda:vAjuda};
-  return `${vTopo()}${S.modo === 'demo' ? vFaixaDemo() : vFaixaInstalar()}<main class="conteudo">${(telas[S.tela] || vEntregas)()}</main>`;
+  return `${vTopo()}${S.modo === 'demo' ? vFaixaDemo() + vFaixaAvisos() : (vFaixaInstalar() || vFaixaAvisos() || vFaixaCopia())}<main class="conteudo">${(telas[S.tela] || vEntregas)()}</main>`;
 }
 
 /* ---------------- tela: entregas do dia ---------------- */
@@ -2188,7 +2303,7 @@ function vCard(p){
   return `<article class="card st-${p.status}">
     <button class="card-corpo" data-a="abrir" data-id="${p.id}">
       <span class="card-l1"><span class="num">#${p.numero}</span>${p.origem === 'loja' ? '<span class="tag">Pela loja</span>' : ''}${p.nfe ? `<span>NF ${esc(p.nfe)}</span>` : lojaEmiteNfe(p.loja_id) && ['pronto','em_rota','entregue'].includes(p.status) && itensNfe(p).length ? '<span class="falta-txt">NF-e a emitir</span>' : ''}</span>
-      <span class="card-loja">${esc(nomeLoja(p.loja_id))}</span>
+      <span class="card-loja">${esc(nomeLoja(p.loja_id))}</span>${(p.fotos || []).includes('entrega') ? `<span class="card-ent">${ICON_CAMERA} Com foto da folha assinada</span>` : ''}
       <span class="card-l3">${n} ${n === 1 ? 'item' : 'itens'} · ${money(totalPedido(p))}</span>
       ${['novo','separacao'].includes(p.status) && p.itens.some(it => it.qtd_atendida != null) ? `<span class="card-setores">${progressoSetores(p).map(x => `${SETORES[x.setor]}: ${x.feito ? 'separado' : 'falta separar'}`).join(' · ')}</span>` : setoresDoPedido(p).length > 1 ? `<span class="card-setores">${setoresDoPedido(p).map(st => `${SETORES[st]} ${p.itens.filter(it => setorDe(it) === st).length}`).join(' · ')}</span>` : ''}
       ${p.itens.some(it => it.qtd_atendida != null && +it.qtd_atendida < +it.qtd_pedida) ? `<span class="card-setores falta-txt">Faltou produto em ${p.itens.filter(it => it.qtd_atendida != null && +it.qtd_atendida < +it.qtd_pedida).length} ${p.itens.filter(it => it.qtd_atendida != null && +it.qtd_atendida < +it.qtd_pedida).length === 1 ? 'item' : 'itens'}</span>` : ''}
@@ -2337,7 +2452,7 @@ function tabelaRel(id, titulo, cols, linhas, valorMax){
 }
 function vRelatorios(){
   const r = S.rel;
-  let h = `<section class="pag-cab"><h1>Relatórios</h1><div class="dia-nav"><label class="rotulo" for="rel-mes">Mês</label><input id="rel-mes" type="month" value="${r.mes}" data-c="relMes" style="width:auto"><button class="btn btn-sm btn-linha" data-a="relCarregar">Atualizar</button></div></section>`;
+  let h = `<section class="pag-cab"><h1>Relatórios</h1><div class="dia-nav"><label class="rotulo" for="rel-mes">Mês</label><input id="rel-mes" type="month" value="${r.mes}" data-c="relMes" style="width:auto"><button class="btn btn-sm btn-linha" data-a="relCarregar">Atualizar</button><button class="btn btn-sm btn-sun" data-a="baixarCopia">Cópia de segurança (Excel)</button></div></section>`;
   if (!r.pedidos) return h + '<p class="vazio">Carregando…</p>';
   const R = calcularRelatorio(r.pedidos);
   const maxL = Math.max(1, ...R.porLoja.map(x => x.valor)), maxE = Math.max(1, ...R.porEnt.map(x => x.valor)), maxP = Math.max(1, ...R.porProduto.map(x => x.valor)), maxD = Math.max(1, ...R.porDia.map(x => x.valor));
@@ -2570,7 +2685,7 @@ function vFaixaDemoAcesso(){
 function vAcesso(){
   const a = S.acc, d = a && a.dados;
   const sub = d ? (d.funcao === 'entregador' ? 'Entregas' : d.funcao === 'separador' ? `Separação · ${d.pessoa.setor ? SETORES[d.pessoa.setor] : 'todos os setores'}` : d.loja.nome) : CONFIG.EMPRESA;
-  let h = `<div class="acesso">${S.demoPessoa ? vFaixaDemoAcesso() : ''}<header class="topo"><div class="topo-in">${vMarca(sub)}<button class="btn-topo" data-a="accAtualizar">Atualizar</button></div></header>${vFaixaInstalar()}<main class="conteudo">`;
+  let h = `<div class="acesso">${S.demoPessoa ? vFaixaDemoAcesso() : ''}<header class="topo"><div class="topo-in">${vMarca(sub)}<div class="topo-dir">${vSino()}<button class="btn-topo" data-a="accAtualizar">Atualizar</button></div></div></header>${vFaixaInstalar()}${vFaixaAvisos()}<main class="conteudo">`;
   if (!d){
     h += a && a.erro ? `<section class="painel"><h1>Não foi possível abrir</h1><p class="erro">${esc(a.erro)}</p>${emApp() ? '<p class="dica">Se você recebeu um link novo, apague este ícone, abra o link novo pelo WhatsApp e instale o aplicativo de novo.</p>' : ''}<div><button class="btn btn-prim" data-a="accAtualizar">Tentar de novo</button></div></section>` : '<p class="vazio">Carregando…</p>';
     return h + '</main></div>';
@@ -2596,7 +2711,7 @@ function vEntregador(d){
     </article>`;
   };
   const acoes = p => {
-    if (a.recebendo && a.recebendo.id === p.id) return `<div class="a-receber"><label class="rotulo" for="rec-nome">Quem recebeu na loja?</label><input id="rec-nome" type="text" autocomplete="off" data-bind="acc.recebendo.nome" value="${esc(a.recebendo.nome)}"><div class="a-bt"><button class="btn btn-linha" data-a="entVoltar">Voltar</button><button class="btn btn-ok" data-a="entConfirmar" data-id="${p.id}">Confirmar entrega</button></div></div>`;
+    if (a.recebendo && a.recebendo.id === p.id) return `<div class="a-receber"><label class="rotulo" for="rec-nome">Quem recebeu na loja?</label><input id="rec-nome" type="text" autocomplete="off" data-bind="acc.recebendo.nome" value="${esc(a.recebendo.nome)}">${vCampoFoto(a.recebendo.foto, 'entFoto', 'Foto da folha de conferência assinada', true)}<div class="a-bt"><button class="btn btn-linha" data-a="entVoltar">Voltar</button><button class="btn btn-ok" data-a="entConfirmar" data-id="${p.id}">Confirmar entrega</button></div></div>`;
     return `<div class="a-bt">${p.status === 'pronto' ? `<button class="btn btn-prim" data-a="entSair" data-id="${p.id}">Saí para entrega</button>` : ''}<button class="btn ${p.status === 'em_rota' ? 'btn-ok' : 'btn-linha'}" data-a="entEntregar" data-id="${p.id}">Entreguei</button></div>`;
   };
   let h = `<div><h1 class="ola">Olá, ${esc(d.pessoa.nome.split(' ')[0])}</h1><p class="ola-sub">${fazer.length ? `${fazer.length} ${fazer.length === 1 ? 'entrega para fazer' : 'entregas para fazer'}` : 'Nenhuma entrega pronta agora.'}</p></div>`;
@@ -2637,6 +2752,7 @@ function vSeparador(d){
         <div class="barra-ferr" style="justify-content:space-between"><label class="sr" for="sep-fi">Buscar produto no pedido</label><input id="sep-fi" type="search" placeholder="Buscar produto em ${SETORES[st]}" data-i="filtroSepItem" value="${esc(sp.filtroItem)}" style="max-width:none;flex:1"><button class="btn btn-sm btn-linha" data-a="sepIgual">Atendido igual ao solicitado</button></div>
         <div class="sep-linhas" id="sep-linhas"><div class="sep-cab" aria-hidden="true"><span>Produto</span><span>Solicitado</span><span>Atendido</span></div>${p.itens.map(i => `<div class="sep-linha" data-sepl="${esc(normBusca(i.produto))}"${!casa(rf, i.produto) ? ' hidden' : ''}><div class="prod-nome"><span>${esc(i.produto)}</span><small id="falta-${i.id}">${textoFalta(i.qtd_pedida, sp.qtd[i.id])}</small></div><div class="sep-sol" aria-label="Solicitado">${qty(i.qtd_pedida)} <small>${esc(i.unidade || '')}</small></div><input class="qtd${sp.qtd[i.id] == null || sp.qtd[i.id] === '' ? ' vazio' : ''}" type="text" inputmode="decimal" autocomplete="off" placeholder="?" aria-label="Atendido de ${esc(i.produto)}" data-sq="${i.id}" value="${esc(sp.qtd[i.id] ?? '')}"></div>`).join('')}</div>
         <p class="dica">O solicitado é o que a loja pediu e não muda. No atendido, lance o que você conseguiu separar (se não tinha, coloque 0). O atendido é o que vai para a loja e o que é cobrado.</p>
+        ${vCampoFoto(sp.foto, 'sepFoto', `Foto da separação de ${SETORES[st]}`, true)}
         <div class="a-bt"><button class="btn btn-linha" data-a="sepFechar">Voltar</button><button class="btn btn-prim" data-a="sepConcluir" data-id="${p.id}">Concluir separação de ${SETORES[st]}</button></div>`;
     } else {
       const lancado = p.itens.every(i => i.qtd_atendida != null);
@@ -2746,7 +2862,7 @@ function vSemPermissao(){
 function vModal(){
   const m = S.modal;
   if (!m) return '';
-  const fn = {instalar:vModalInstalar, nfe:vModalNfe, pedido:vModalPedido, entregar:vModalEntregar, confirmar:vModalConfirmar, imprimir:vModalImprimir, copiar:vModalCopiar, importar:vModalImportar}[m.tipo];
+  const fn = {avisos:vModalAvisos, foto:vModalFoto, instalar:vModalInstalar, nfe:vModalNfe, pedido:vModalPedido, entregar:vModalEntregar, confirmar:vModalConfirmar, imprimir:vModalImprimir, copiar:vModalCopiar, importar:vModalImportar}[m.tipo];
   return fn ? fn(m) : '';
 }
 function vModalPedido(m){
@@ -2767,6 +2883,7 @@ function vModalPedido(m){
       <div class="campo"><label for="m-nfe">Nº da NF-e <span class="opc">(opcional)</span></label><input id="m-nfe" type="text" inputmode="numeric" value="${esc(p.nfe || '')}" data-bind="modal.p.nfe"></div>
       ${idx >= 2 ? `<div class="campo"><label for="m-rec">Recebido por</label><input id="m-rec" type="text" value="${esc(p.recebido_por || '')}" data-bind="modal.p.recebido_por"></div>` : ''}
     </div>
+    ${vFotosPedido(p)}
     <div class="m-itens-cab"><h3>Itens</h3></div>
     ${daLoja ? '<p class="dica">O <b>solicitado</b> foi a loja que pediu e só ela pode mudar. Aqui você lança o <b>atendido</b>.</p>' : ''}
     <div class="tabela-rolar"><table><thead><tr><th>Produto</th><th class="n">Solicitado</th><th class="n">Atendido</th><th class="n">Preço</th><th class="n">Subtotal</th><th>${daLoja ? '' : '<span class="sr">Remover</span>'}</th></tr></thead>
@@ -2972,7 +3089,7 @@ async function carregarAcesso(silencioso){
 function abrirSeparacao(id){
   const sp = S.acc.sep, d = S.acc.dados, st = abaSeparador(d), p = pedidosDoSetor(d, st).find(x => x.id === id);
   if (!p){ toast('Este pedido não está mais na lista.', 'erro'); render(); return; }
-  sp.aberto = id; sp.filtroItem = ''; sp.qtd = {};
+  sp.aberto = id; sp.filtroItem = ''; sp.qtd = {}; sp.foto = null;
   if (!sp.nome) sp.nome = nomeGuardado(st);
   p.itens.forEach(i => { sp.qtd[i.id] = i.qtd_atendida != null ? qtyInput(i.qtd_atendida) : ''; });
   window.scrollTo(0, 0); render();
@@ -2980,7 +3097,7 @@ function abrirSeparacao(id){
 }
 const formSol = () => ({data:'', qtd:{}, observacao:'', filtro:'', fs:{}, editId:null, editNumero:null, revisao:false});
 function abrirAcesso(token){
-  S.acc = {token, dados:null, erro:'', aba:'pedir', form:formSol(), enviado:null, recebendo:null, sep:{aberto:null, qtd:{}, filtro:'', filtroItem:'', aba:'', nome:''}};
+  S.acc = {token, dados:null, erro:'', aba:'pedir', form:formSol(), enviado:null, recebendo:null, sep:{aberto:null, qtd:{}, filtro:'', filtroItem:'', aba:'', nome:'', foto:null}};
   S.vista = 'acesso';
   render();
   return carregarAcesso();
@@ -3034,6 +3151,39 @@ const pedidosParaImprimir = m => m.modo === 'separacao' ? m.pedidos.filter(p => 
 const ACOES = {
   ir: el => irPara(el.dataset.tela),
   sair(){ if (api.sair) api.sair(); S.vista = 'login'; S.login.erro = ''; S.modal = null; render(); },
+  avisosAbrir(){ S.modal = {tipo:'avisos'}; render(); },
+  avisosLigar(){
+    const papel = papelAvisos();
+    AV.ligado = true; gravarLocal('parada_avisos', '1');
+    try { if (papel) localStorage.removeItem(chaveBaseAvisos(papel)); } catch(e) {}
+    try { const C = window.AudioContext || window.webkitAudioContext; if (C && !AV.ctx) AV.ctx = new C(); } catch(e) {}
+    if ('Notification' in window && Notification.permission === 'default'){ try { const r = Notification.requestPermission(); if (r && r.then) r.then(() => render(), () => {}); } catch(e) {} }
+    tocarSom(); pedirTelaLigada(); vigiar(); render();
+    toast('Avisos ligados neste celular.');
+  },
+  avisosDesligar(){ AV.ligado = false; gravarLocal('parada_avisos', '0'); soltarTela(); render(); toast('Avisos desligados neste celular.'); },
+  avisosTestar(){ avisar([{t:'Teste de aviso', m:'Os avisos do Parada Pedidos estão funcionando neste celular.'}]); },
+  avisosAgoraNao(){ gravarLocal('parada_avisos', '0'); render(); },
+  avisosOk(){ AV.lista = []; desenharAvisos(); atualizarTelaSePuder(); },
+  fotoRemover: el => { if (el.dataset.k === 'entFoto' && S.acc.recebendo) S.acc.recebendo.foto = null; if (el.dataset.k === 'sepFoto') S.acc.sep.foto = null; render(); },
+  async verFoto(el){
+    const m = S.modal, p = m.p, t = el.dataset.t;
+    const f = {tipo:'foto', titulo:`#${p.numero} ${nomeLoja(p.loja_id)} · ${NOME_FOTO(t)}`, src:null, voltar:m, arquivo:`pedido-${p.numero}-${t}.jpg`};
+    S.modal = f; render();
+    try {
+      const r = await api.fotoDoPedido(p.id, t);
+      if (S.modal !== f) return;
+      if (!r){ S.modal = m; render(); toast('Essa foto não está mais guardada. As fotos antigas são apagadas.', 'erro'); return; }
+      Object.assign(f, {src:r.foto, por:r.enviado_por, em:r.enviado_em}); render();
+    } catch(e) { if (S.modal === f){ S.modal = m; render(); } toast(e.message, 'erro'); }
+  },
+  baixarCopia: () => tentar(async () => {
+    toast('Preparando a cópia de segurança…');
+    const {blob, pedidos} = await gerarCopiaSeguranca();
+    baixarArquivo(blob, `parada-pedidos-copia-${today()}.xlsx`);
+    gravarLocal('parada_ultima_copia', today());
+    toast(`Cópia baixada, com ${pedidos} ${pedidos === 1 ? 'pedido' : 'pedidos'}. Guarde o arquivo no computador.`); render();
+  }),
   async instalarApp(){
     if (pedidoInstalar){ const p = pedidoInstalar; pedidoInstalar = null; try { p.prompt(); await p.userChoice; } catch(e) {} render(); return; }
     S.modal = {tipo:'instalar'}; render();
@@ -3082,7 +3232,7 @@ const ACOES = {
     if (m.marcar) await carregarDia(); else render();
   }),
   fechar(){
-    if (S.modal && ['imprimir','nfe'].includes(S.modal.tipo) && S.modal.voltar){ S.modal = S.modal.voltar; render(); return; }
+    if (S.modal && ['imprimir','nfe','foto'].includes(S.modal.tipo) && S.modal.voltar){ S.modal = S.modal.voltar; render(); return; }
     S.modal = null; render();
   },
   igualPedido: el => { const st = el.dataset.setor; S.modal.p.itens.forEach(it => { if ((!st || setorDe(it) === st) && it.qtd_atendida == null) it.qtd_atendida = +it.qtd_pedida; }); render(); },
@@ -3226,21 +3376,22 @@ const ACOES = {
   accAtualizar: () => { S.acc.erro = ''; carregarAcesso(); },
   accAba: el => { S.acc.aba = el.dataset.aba; S.acc.enviado = null; window.scrollTo(0, 0); render(); if (el.dataset.aba === 'meus') carregarAcesso(true); },
   entSair: el => tentar(async () => { S.acc.dados = await api.entregadorAtualizar(S.acc.token, el.dataset.id, 'sair'); S.acc.erro = ''; toast('Saída registrada. Boa entrega!'); render(); }),
-  entEntregar: el => { S.acc.recebendo = {id:el.dataset.id, nome:''}; render(); const i = document.getElementById('rec-nome'); if (i) i.focus(); },
+  entEntregar: el => { S.acc.recebendo = {id:el.dataset.id, nome:'', foto:null}; render(); const i = document.getElementById('rec-nome'); if (i) i.focus(); },
   entVoltar(){ S.acc.recebendo = null; render(); },
   entConfirmar: el => tentar(async () => {
     const nome = (S.acc.recebendo.nome || '').trim();
     if (!nome){ toast('Escreva o nome de quem recebeu.', 'erro'); return; }
-    S.acc.dados = await api.entregadorAtualizar(S.acc.token, el.dataset.id, 'entregar', nome);
-    S.acc.recebendo = null; S.acc.erro = ''; toast('Entrega confirmada.'); render();
+    const foto = S.acc.recebendo.foto || null;
+    S.acc.dados = await api.entregadorAtualizar(S.acc.token, el.dataset.id, 'entregar', nome, foto);
+    S.acc.recebendo = null; S.acc.erro = ''; toast(foto ? 'Entrega confirmada, com a foto.' : 'Entrega confirmada.'); render();
   }),
   sepComecar: el => tentar(async () => {
     S.acc.dados = await api.separadorIniciar(S.acc.token, el.dataset.id);
     abrirSeparacao(el.dataset.id);
   }),
   sepAbrir: el => abrirSeparacao(el.dataset.id),
-  sepFechar(){ S.acc.sep.aberto = null; S.acc.sep.filtroItem = ''; render(); },
-  sepAba: el => { const sp = S.acc.sep; sp.aba = el.dataset.setor; sp.aberto = null; sp.filtroItem = ''; sp.nome = ''; window.scrollTo(0, 0); render(); },
+  sepFechar(){ S.acc.sep.aberto = null; S.acc.sep.filtroItem = ''; S.acc.sep.foto = null; render(); },
+  sepAba: el => { const sp = S.acc.sep; sp.aba = el.dataset.setor; sp.aberto = null; sp.filtroItem = ''; sp.nome = ''; sp.foto = null; window.scrollTo(0, 0); render(); },
   sepIgual(){ const sp = S.acc.sep, p = pedidosDoSetor(S.acc.dados, sp.aba).find(x => x.id === sp.aberto); p.itens.forEach(i => { const v = sp.qtd[i.id]; if (v == null || v === '') sp.qtd[i.id] = qtyInput(i.qtd_pedida); }); render(); },
   sepConcluir: el => tentar(async () => {
     const sp = S.acc.sep, st = sp.aba, p = pedidosDoSetor(S.acc.dados, st).find(x => x.id === el.dataset.id);
@@ -3250,9 +3401,9 @@ const ACOES = {
     const vazios = itens.filter(i => i.qtd == null || i.qtd < 0).length;
     if (vazios){ toast(`Falta lançar ${vazios} ${vazios === 1 ? 'item' : 'itens'}. Se não tinha, coloque 0.`, 'erro'); return; }
     const faltas = p.itens.filter(i => parseNum(sp.qtd[i.id]) < +i.qtd_pedida).map(i => `${i.produto} (${qty(+i.qtd_pedida - parseNum(sp.qtd[i.id]))})`);
-    S.acc.dados = await api.separadorLancar(S.acc.token, p.id, itens, nome, st);
+    S.acc.dados = await api.separadorLancar(S.acc.token, p.id, itens, nome, st, sp.foto || null);
     ls.set('parada_separador_nome_' + st, nome);
-    sp.aberto = null; sp.filtroItem = '';
+    sp.aberto = null; sp.filtroItem = ''; sp.foto = null;
     toast(`Pedido #${p.numero}: ${SETORES[st]} separado por ${nome}.${faltas.length ? ' Faltou: ' + faltas.join(', ') + '.' : ' Tudo completo.'}`);
     window.scrollTo(0, 0); render();
   }),
@@ -3307,6 +3458,9 @@ const MUDANCAS = {
     toast(`Pedido #${p.numero}: ${STATUS[st].label.toLowerCase()}.`);
     abrirPedidoModal(await api.pedido(p.id)); await carregarDia(true);
   }),
+  entFoto: el => lerFotoEm(el, f => { if (S.acc.recebendo) S.acc.recebendo.foto = f; }),
+  sepFoto: el => lerFotoEm(el, f => { S.acc.sep.foto = f; }),
+  avisosTela: el => { AV.tela = el.checked; gravarLocal('parada_tela_ligada', AV.tela ? '1' : '0'); if (AV.tela) pedirTelaLigada(); else soltarTela(); },
   demoPessoa: el => { const p = S.pessoas.find(x => x.id === el.value); if (p){ S.demoPessoa = p.id; abrirAcesso(p.token); } },
 };
 const ENTRADAS = {
@@ -3393,6 +3547,286 @@ setInterval(() => {
   else if (S.vista === 'acesso' && S.acc && S.acc.dados && !S.acc.recebendo && !S.acc.sep.aberto && !foco && (S.acc.dados.funcao !== 'solicitante' || S.acc.aba === 'meus')) carregarAcesso(true);
 }, 60000);
 
+/* ---------------- avisos (som, vibração e notificação com o aplicativo aberto) ---------------- */
+const AV = {ligado: lerLocal('parada_avisos') === '1', tela: lerLocal('parada_tela_ligada') === '1', lista:[], ctx:null, wake:null, rodando:false, locais:{}};
+const ICON_SINO = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 20a2 2 0 0 0 4 0"/></svg>';
+const ICON_SINO_OFF = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 20a2 2 0 0 0 4 0"/><path d="M3 3l18 18"/></svg>';
+function papelAvisos(){
+  if (S.vista === 'escritorio') return 'admin';
+  if (S.vista === 'acesso' && S.acc && S.acc.dados && S.acc.dados.funcao === 'separador') return 'separador';
+  return null;
+}
+const chaveBaseAvisos = papel => 'parada_avisos_base_' + (papel === 'admin' ? 'escritorio' : String(S.acc.token).slice(0, 16));
+function marcarLocal(pid, setor){ if (pid) AV.locais[pid + '|' + (setor || '*')] = Date.now(); }
+const foiLocal = (pid, setor) => [pid + '|*', pid + '|' + setor].some(k => AV.locais[k] && Date.now() - AV.locais[k] < 120000);
+// marca o que este celular mesmo fez, para não avisar a pessoa do que ela acabou de fazer
+function observarApi(a){
+  const pids = {atualizarPedido:x => [x[0]], substituirItens:x => [x[0]], excluirPedido:x => [x[0]], atualizarItens:() => [S.modal && S.modal.p && S.modal.p.id],
+    separadorLancar:x => [x[1], x[4]], separadorIniciar:x => [x[1]], entregadorAtualizar:x => [x[1]]};
+  Object.entries(pids).forEach(([k, f]) => { const orig = a[k]; if (typeof orig !== 'function') return; a[k] = function(...args){ const [pid, st] = f(args); marcarLocal(pid, st); return orig.apply(this, args); }; });
+  const criar = a.criarPedido;
+  if (criar) a.criarPedido = async function(...args){ const r = await criar.apply(this, args); if (r && r.id) marcarLocal(r.id); return r; };
+}
+function retratoPedidos(peds){
+  const r = {};
+  (peds || []).forEach(p => {
+    const set = {};
+    (p.itens || []).forEach(i => {
+      if (!(+i.qtd_pedida > 0)) return;
+      const st = setorDe(i), x = set[st] || (set[st] = {feito:true, nomes:[], falta:0});
+      if (i.qtd_atendida == null) x.feito = false;
+      else { if (i.separado_por && !x.nomes.includes(i.separado_por)) x.nomes.push(i.separado_por); if (+i.qtd_atendida < +i.qtd_pedida) x.falta++; }
+    });
+    const assin = (p.itens || []).map(i => (i.produto_id || i.produto || i.produto_nome) + ':' + (+i.qtd_pedida)).sort().join('|');
+    r[p.id] = {n:p.numero, loja:p.loja_nome || nomeLoja(p.loja_id) || '', st:p.status, data:p.data_entrega, origem:p.origem || 'loja', rec:p.recebido_por || '', set, assin};
+  });
+  return r;
+}
+function novidades(ant, atu, papel){
+  const ev = [];
+  Object.entries(atu).forEach(([id, p]) => {
+    const a = ant[id], quem = `#${p.n} ${p.loja}`;
+    if (!a){
+      if (['novo','separacao'].includes(p.st) && (papel === 'separador' || p.origem === 'loja') && !foiLocal(id, '*')) ev.push({t:'Pedido novo', m:`${quem} · entrega ${fmtDia(p.data)}`});
+      return;
+    }
+    if (a.assin !== p.assin && ['novo','separacao'].includes(p.st) && !foiLocal(id, '*')) ev.push({t:'Pedido alterado', m:`${quem}: a loja mudou o pedido.`});
+    ORDEM_SETOR.forEach(st => {
+      const x = p.set[st], xa = a.set[st];
+      if (x && x.feito && !(xa && xa.feito) && !foiLocal(id, st))
+        ev.push({t:`${SETORES[st]} separado`, m:`${quem}: ${SETORES[st]} separado por ${x.nomes.join(', ') || 'alguém'}${x.falta ? ` · faltou ${x.falta} ${x.falta === 1 ? 'item' : 'itens'}` : ''}.`});
+    });
+    if (papel === 'admin'){
+      if (p.st === 'pronto' && a.st !== 'pronto' && ['novo','separacao'].includes(a.st)) ev.push({t:'Pedido pronto', m:`${quem}: todos os setores separados, pronto para sair.`});
+      if (p.st === 'entregue' && a.st !== 'entregue' && !foiLocal(id, '*')) ev.push({t:'Pedido entregue', m:`${quem} entregue${p.rec ? `, recebido por ${p.rec}` : ''}.`});
+      if (p.st === 'cancelado' && a.st !== 'cancelado' && !foiLocal(id, '*')) ev.push({t:'Pedido cancelado', m:`${quem} foi cancelado.`});
+    }
+  });
+  if (papel === 'separador') Object.entries(ant).forEach(([id, a]) => {
+    if (!atu[id] && ['novo','separacao'].includes(a.st) && !foiLocal(id, '*')) ev.push({t:'Pedido cancelado', m:`#${a.n} ${a.loja} saiu da lista de separação (cancelado).`});
+  });
+  return ev;
+}
+async function vigiar(){
+  const papel = papelAvisos();
+  if (!AV.ligado || AV.rodando || !papel) return;
+  AV.rodando = true;
+  try {
+    const peds = papel === 'admin' ? await api.vigia(addDays(today(), -3)) : ((await api.acessoPainel(S.acc.token)) || {}).pedidos;
+    if (papelAvisos() !== papel) return;
+    const atual = retratoPedidos(peds), chave = chaveBaseAvisos(papel);
+    let ant = null; try { ant = JSON.parse(lerLocal(chave) || 'null'); } catch(e) {}
+    gravarLocal(chave, JSON.stringify(atual));
+    if (!ant) return;
+    const ev = novidades(ant, atual, papel);
+    if (ev.length){ avisar(ev); atualizarTelaSePuder(); }
+  } catch(e) { /* sem internet agora: tenta de novo na próxima volta */ }
+  finally { AV.rodando = false; }
+}
+function atualizarTelaSePuder(){
+  if (S.modal || S.ocupado) return;
+  const foco = document.activeElement && document.activeElement.matches('input,textarea,select');
+  if (foco) return;
+  if (S.vista === 'escritorio' && S.tela === 'entregas') carregarDia(true);
+  else if (S.vista === 'acesso' && S.acc && S.acc.dados && !S.acc.recebendo && !S.acc.sep.aberto) carregarAcesso(true);
+}
+function avisar(ev){
+  const hora = new Date().toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'});
+  AV.lista = [...ev.map(e => ({...e, hora})).reverse(), ...AV.lista].slice(0, 20);
+  desenharAvisos();
+  tocarSom();
+  try { if (navigator.vibrate) navigator.vibrate([250, 120, 250]); } catch(e) {}
+  const titulo = ev.length === 1 ? ev[0].t : `${ev.length} novidades no Parada Pedidos`;
+  const corpo = ev.length === 1 ? ev[0].m : ev.slice(0, 4).map(e => e.m).join('\n') + (ev.length > 4 ? `\ne mais ${ev.length - 4}` : '');
+  notificar(titulo, corpo);
+}
+async function notificar(titulo, corpo){
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const op = {body:corpo, icon:'icon-192.png', badge:'icon-192.png', tag:'parada-pedidos', renotify:true, vibrate:[250, 120, 250]};
+  try { const reg = navigator.serviceWorker && await navigator.serviceWorker.getRegistration(); if (reg){ await reg.showNotification(titulo, op); return; } } catch(e) {}
+  try { new Notification(titulo, op); } catch(e) {}
+}
+function tocarSom(){
+  try {
+    const C = window.AudioContext || window.webkitAudioContext;
+    if (!C) return;
+    AV.ctx = AV.ctx || new C();
+    if (AV.ctx.state === 'suspended') AV.ctx.resume();
+    const t = AV.ctx.currentTime;
+    [[880, 0], [1175, 0.2], [880, 0.4]].forEach(([f, d]) => {
+      const o = AV.ctx.createOscillator(), g = AV.ctx.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, t + d); g.gain.exponentialRampToValueAtTime(0.4, t + d + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + d + 0.18);
+      o.connect(g); g.connect(AV.ctx.destination); o.start(t + d); o.stop(t + d + 0.2);
+    });
+  } catch(e) {}
+}
+function desenharAvisos(){
+  let r = document.getElementById('avisos-raiz');
+  if (!r){ r = document.createElement('div'); r.id = 'avisos-raiz'; document.body.appendChild(r); }
+  if (!AV.lista.length){ r.innerHTML = ''; return; }
+  r.innerHTML = `<div class="avisos-caixa" role="status" aria-live="polite"><div class="avisos-cab"><b>${ICON_SINO} ${AV.lista.length === 1 ? 'Novo aviso' : `${AV.lista.length} avisos`}</b><button class="btn btn-sm btn-sun" data-a="avisosOk">OK</button></div>
+    <ul>${AV.lista.slice(0, 3).map(e => `<li><b>${esc(e.t)}</b> <small>${e.hora}</small><br>${esc(e.m)}</li>`).join('')}</ul>${AV.lista.length > 3 ? `<p class="dica">e mais ${AV.lista.length - 3}</p>` : ''}</div>`;
+}
+async function pedirTelaLigada(){
+  if (!AV.ligado || !AV.tela || !('wakeLock' in navigator) || document.visibilityState !== 'visible' || (AV.wake && !AV.wake.released)) return;
+  try { AV.wake = await navigator.wakeLock.request('screen'); } catch(e) {}
+}
+function soltarTela(){ try { if (AV.wake) AV.wake.release(); } catch(e) {} AV.wake = null; }
+const vSino = () => papelAvisos() ? `<button class="btn-topo btn-sino${AV.ligado ? ' on' : ''}" data-a="avisosAbrir" aria-label="Avisos ${AV.ligado ? 'ligados' : 'desligados'}" title="Avisos">${AV.ligado ? ICON_SINO : ICON_SINO_OFF}</button>` : '';
+function vFaixaAvisos(){
+  const papel = papelAvisos();
+  if (!papel || lerLocal('parada_avisos') != null) return '';
+  return `<div class="faixa-demo faixa-avisos"><div class="faixa-demo-in"><p><b>Avisos:</b> ligue para o celular tocar quando ${papel === 'admin' ? 'chegar pedido e quando cada setor terminar a separação' : 'chegar pedido novo e quando cada setor terminar a separação'}.</p>
+    <div class="grupo"><button class="btn btn-sm btn-sun" data-a="avisosLigar">Ligar avisos</button><button class="btn btn-sm btn-linha" data-a="avisosAgoraNao">Agora não</button></div></div></div>`;
+}
+function vModalAvisos(){
+  const papel = papelAvisos();
+  const quando = papel === 'admin' ? 'chega pedido novo das lojas, a loja altera ou cancela, cada setor termina a separação, o pedido fica pronto e quando é entregue'
+    : 'chega pedido novo, a loja altera ou cancela um pedido e quando cada setor termina a separação';
+  const perm = 'Notification' in window ? Notification.permission : 'nao';
+  return `<div class="modal-fundo"><div class="modal estreito" role="dialog" aria-modal="true" aria-labelledby="mav-tit">
+    <h2 id="mav-tit">Avisos neste celular</h2>
+    <p>Com os avisos ligados, o celular toca, vibra e mostra uma notificação quando ${quando}.</p>
+    <p class="dica">Funciona com o aplicativo aberto ou minimizado há pouco tempo. Com a tela apagada por muito tempo, o celular pausa o aplicativo, e os avisos aparecem quando você abrir de novo.</p>
+    ${perm === 'denied' ? '<p class="erro">As notificações estão bloqueadas neste celular. O som e o aviso na tela continuam funcionando. Para liberar, segure o ícone do aplicativo → Informações do app → Notificações.</p>' : ''}
+    ${'wakeLock' in navigator ? `<label class="check"><input type="checkbox" data-c="avisosTela"${AV.tela ? ' checked' : ''}> Manter a tela ligada com o aplicativo aberto</label>` : ''}
+    <div class="rodape-botoes">${AV.ligado ? '<button class="btn btn-prim" data-a="avisosTestar">Testar aviso</button><button class="btn btn-linha" data-a="avisosDesligar">Desligar avisos</button>' : '<button class="btn btn-prim" data-a="avisosLigar">Ligar avisos</button>'}<button class="btn btn-linha" data-a="fechar">Fechar</button></div></div></div>`;
+}
+document.addEventListener('pointerdown', () => {
+  if (!AV.ligado) return;
+  try { const C = window.AudioContext || window.webkitAudioContext; if (C && !AV.ctx) AV.ctx = new C(); if (AV.ctx && AV.ctx.state === 'suspended') AV.ctx.resume(); } catch(e) {}
+}, true);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible'){ pedirTelaLigada(); vigiar(); } });
+setInterval(vigiar, 30000);
+
+/* ---------------- fotos (separação e entrega) ---------------- */
+const ICON_CAMERA = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>';
+const NOME_FOTO = tipo => tipo === 'entrega' ? 'Entrega (folha assinada)' : SETORES[tipo] ? `Separação ${SETORES[tipo]}` : 'Separação';
+async function prepararFoto(arquivo){
+  const url = URL.createObjectURL(arquivo);
+  try {
+    const img = await new Promise((ok, erro) => { const i = new Image(); i.onload = () => ok(i); i.onerror = erro; i.src = url; });
+    const max = 1280, k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
+    const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+    let q = 0.62, dado = c.toDataURL('image/jpeg', q);
+    while (dado.length > 230000 && q > 0.32){ q -= 0.1; dado = c.toDataURL('image/jpeg', q); }
+    return dado;
+  } finally { URL.revokeObjectURL(url); }
+}
+async function lerFotoEm(el, guardar){
+  const arq = el.files && el.files[0];
+  if (!arq) return;
+  toast('Preparando a foto…');
+  try { guardar(await prepararFoto(arq)); toast('Foto pronta.'); }
+  catch(e) { toast('Não consegui ler a foto. Tente de novo.', 'erro'); }
+  render();
+}
+function vCampoFoto(foto, chave, rotulo, opcional){
+  const entrada = `<input type="file" accept="image/*" capture="environment" data-c="${chave}" class="sr">`;
+  return `<div class="campo foto-campo"><span class="rotulo">${rotulo}${opcional ? ' <span class="opc">(opcional)</span>' : ''}</span>
+    ${foto ? `<div class="foto-prev"><img src="${foto}" alt="Foto tirada"><div class="a-bt"><label class="btn btn-sm btn-linha">${entrada}Tirar outra</label><button type="button" class="btn btn-sm btn-linha" data-a="fotoRemover" data-k="${chave}">Remover</button></div></div>`
+      : `<label class="btn btn-sun btn-foto">${entrada}${ICON_CAMERA} Tirar foto</label>`}</div>`;
+}
+function vFotosPedido(p){
+  const lista = (p.fotos || []).slice().sort((a, b) => (a === 'entrega') - (b === 'entrega') || ORDEM_SETOR.indexOf(a) - ORDEM_SETOR.indexOf(b));
+  if (!lista.length) return p.status === 'entregue' ? '<p class="dica">Entregue sem foto da folha assinada.</p>' : '';
+  return `<div class="campo"><span class="rotulo">Fotos</span><div class="presets">${lista.map(t => `<button type="button" class="btn btn-sm btn-linha" data-a="verFoto" data-t="${esc(t)}">${ICON_CAMERA} ${esc(NOME_FOTO(t))}</button>`).join('')}</div></div>`;
+}
+function vModalFoto(m){
+  return `<div class="modal-fundo"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="mf-tit">
+    <header class="m-cab"><div><h2 id="mf-tit">${esc(m.titulo)}</h2><p class="m-sub">${m.por ? `<span>Enviada por ${esc(m.por)}</span>` : ''}${m.em ? `<span>${dataHora(m.em)}</span>` : ''}</p></div><button class="btn-ico" data-a="fechar" aria-label="Fechar">×</button></header>
+    ${m.src ? `<img class="foto-grande" src="${m.src}" alt="${esc(m.titulo)}">` : '<p class="vazio">Carregando a foto…</p>'}
+    <div class="rodape-botoes">${m.src ? `<a class="btn btn-linha" href="${m.src}" download="${esc(m.arquivo)}">Baixar foto</a>` : ''}<button class="btn btn-prim" data-a="fechar">Voltar</button></div></div></div>`;
+}
+
+/* ---------------- cópia de segurança (Excel) ---------------- */
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++){ let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+const crc32 = b => { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC_T[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+function zipar(arquivos){
+  const enc = new TextEncoder(), partes = [], central = []; let pos = 0;
+  const u16 = v => [v & 255, (v >>> 8) & 255], u32 = v => [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255];
+  arquivos.forEach(a => {
+    const nome = enc.encode(a.nome), dados = typeof a.dados === 'string' ? enc.encode(a.dados) : a.dados, crc = crc32(dados), n = dados.length;
+    const loc = new Uint8Array([0x50,0x4b,3,4, ...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(n), ...u32(n), ...u16(nome.length), ...u16(0)]);
+    partes.push(loc, nome, dados);
+    central.push(new Uint8Array([0x50,0x4b,1,2, ...u16(20), ...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(n), ...u32(n), ...u16(nome.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(pos)]), nome);
+    pos += loc.length + nome.length + n;
+  });
+  const tam = central.reduce((s, x) => s + x.length, 0);
+  const fim = new Uint8Array([0x50,0x4b,5,6, ...u16(0), ...u16(0), ...u16(arquivos.length), ...u16(arquivos.length), ...u32(tam), ...u32(pos), ...u16(0)]);
+  return new Blob([...partes, ...central, fim], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+}
+const xEsc = t => String(t).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').replace(/[&<>"]/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;'}[c]));
+const colXl = i => { let s = ''; i++; while (i){ const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
+const BASE_XL = Date.UTC(1899, 11, 30);
+const diaXl = iso => { if (!iso) return null; const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number); return y ? {v:(Date.UTC(y, m - 1, d) - BASE_XL) / 86400000, s:2} : null; };
+const horaXl = ts => { if (!ts) return null; const d = new Date(ts); if (isNaN(d)) return null; return {v:(d.getTime() - d.getTimezoneOffset() * 60000 - BASE_XL) / 86400000, s:4}; };
+const dinXl = v => ({v:Math.round((+v || 0) * 100) / 100, s:3});
+function folhaXl(linhas, larguras){
+  const rows = linhas.map((l, r) => `<row r="${r + 1}">${l.map((c, i) => {
+    if (c == null || c === '') return '';
+    const o = typeof c === 'object' ? c : {v:c}, ref = colXl(i) + (r + 1), st = r === 0 ? 1 : (o.s || 0);
+    return typeof o.v === 'number' && isFinite(o.v) ? `<c r="${ref}" s="${st}"><v>${o.v}</v></c>` : `<c r="${ref}" s="${st}" t="inlineStr"><is><t xml:space="preserve">${xEsc(o.v)}</t></is></c>`;
+  }).join('')}</row>`).join('');
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${larguras.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('')}</cols><sheetData>${rows}</sheetData></worksheet>`;
+}
+function montarXlsx(folhas){
+  const ns = 'http://schemas.openxmlformats.org';
+  const arqs = [
+    {nome:'[Content_Types].xml', dados:`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="${ns}/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${folhas.map((f, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('')}</Types>`},
+    {nome:'_rels/.rels', dados:`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${ns}/package/2006/relationships"><Relationship Id="rId1" Type="${ns}/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`},
+    {nome:'xl/workbook.xml', dados:`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="${ns}/spreadsheetml/2006/main" xmlns:r="${ns}/officeDocument/2006/relationships"><sheets>${folhas.map((f, i) => `<sheet name="${xEsc(f.nome)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('')}</sheets></workbook>`},
+    {nome:'xl/_rels/workbook.xml.rels', dados:`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="${ns}/package/2006/relationships">${folhas.map((f, i) => `<Relationship Id="rId${i + 1}" Type="${ns}/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('')}<Relationship Id="rId${folhas.length + 1}" Type="${ns}/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`},
+    {nome:'xl/styles.xml', dados:`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="${ns}/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="dd/mm/yyyy hh:mm"/><numFmt numFmtId="165" formatCode="dd/mm/yyyy"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFBE8E8"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="5"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="4" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`},
+    ...folhas.map((f, i) => ({nome:`xl/worksheets/sheet${i + 1}.xml`, dados:folhaXl(f.linhas, f.larguras)})),
+  ];
+  return zipar(arqs);
+}
+async function gerarCopiaSeguranca(aoAvancar){
+  const [peds, lojas, produtos, pessoas] = await Promise.all([api.backupPedidos(aoAvancar), api.lojas(), api.produtos(), api.pessoas()]);
+  const lojaNome = id => (lojas.find(l => l.id === id) || {}).nome || '';
+  const pessoaNome = id => (pessoas.find(x => x.id === id) || {}).nome || '';
+  const simNao = v => v ? 'Sim' : 'Não';
+  const folhas = [
+    {nome:'Pedidos', larguras:[8,12,26,16,11,18,18,7,12,18,10,22,17,17,17,17,40],
+      linhas:[['Nº','Entrega','Loja','Etapa','Origem','Pedido por','Entregador','Itens','Valor (R$)','Recebido por','NF-e','Fotos','Criado em','Separado em','Saiu em','Entregue em','Observação'],
+        ...peds.map(p => [p.numero, diaXl(p.data_entrega), lojaNome(p.loja_id), (STATUS[p.status] || {}).label || p.status, p.origem === 'loja' ? 'Loja' : 'Escritório', p.solicitante || '', pessoaNome(p.entregador_id),
+          itensValidos(p).length, dinXl(totalPedido(p)), p.recebido_por || '', p.nfe || '', (p.fotos || []).map(NOME_FOTO).join(', '),
+          horaXl(p.criado_em), horaXl(p.separado_em), horaXl(p.saiu_em), horaXl(p.entregue_em), p.observacao || ''])]},
+    {nome:'Itens dos pedidos', larguras:[8,12,26,16,16,22,40,7,11,11,11,12,18],
+      linhas:[['Nº','Entrega','Loja','Etapa','Setor','Categoria','Produto','Un.','Solicitado','Atendido','Preço (R$)','Valor (R$)','Separado por'],
+        ...peds.flatMap(p => (p.itens || []).map(i => [p.numero, diaXl(p.data_entrega), lojaNome(p.loja_id), (STATUS[p.status] || {}).label || p.status, SETORES[setorDe(i)], i.categoria || '', i.produto_nome, i.unidade || '',
+          +i.qtd_pedida || 0, i.qtd_atendida == null ? '' : +i.qtd_atendida, dinXl(i.preco_unit), dinXl(qtdEfetiva(i) * (+i.preco_unit || 0)), i.separado_por || '']))]},
+    {nome:'Lojas', larguras:[28,14,12,30,36,16,18,8],
+      linhas:[['Loja','Cód. Parceiro','Recebe NF-e','Dias de entrega','Endereço','Telefone','Contato','Ativa'],
+        ...lojas.map(l => [l.nome, l.codigo_parceiro || '', simNao(l.emite_nfe !== false), descDias(l.dias_entrega), l.endereco || '', l.telefone || '', l.contato || '', simNao(l.ativo)])]},
+    {nome:'Produtos', larguras:[12,44,16,24,7,11,8],
+      linhas:[['Cód. Parceiro','Produto','Setor','Categoria','Un.','Preço (R$)','Ativo'],
+        ...produtos.slice().sort(porCatNome).map(x => [x.codigo_parceiro || '', x.nome, SETORES[setorDe(x)], x.categoria || '', x.unidade || '', dinXl(x.preco), simNao(x.ativo)])]},
+    {nome:'Pessoas', larguras:[28,14,26,22,18,10],
+      linhas:[['Nome','Função','Loja','Setor','WhatsApp','Acesso'],
+        ...pessoas.map(x => [x.nome, FUNCOES[x.funcao] || x.funcao, x.funcao === 'solicitante' ? lojaNome(x.loja_id) : '', x.funcao === 'separador' ? (x.setor ? SETORES[x.setor] : 'Todos os setores') : '', x.telefone || '', x.ativo ? 'Ligado' : 'Desligado'])]},
+  ];
+  return {blob:montarXlsx(folhas), pedidos:peds.length};
+}
+function baixarArquivo(blob, nome){
+  const url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = nome; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+const diasDesdeCopia = () => { const d = lerLocal('parada_ultima_copia'); return d ? Math.floor((Date.parse(today()) - Date.parse(d)) / 86400000) : null; };
+function vFaixaCopia(){
+  if (S.modo !== 'real' || S.tela !== 'entregas') return '';
+  if (!lerLocal('parada_primeiro_uso')) gravarLocal('parada_primeiro_uso', today());
+  const dias = diasDesdeCopia(), uso = Math.floor((Date.parse(today()) - Date.parse(lerLocal('parada_primeiro_uso') || today())) / 86400000);
+  if (dias == null ? uso < 30 : dias < 30) return '';
+  return `<div class="faixa-demo faixa-copia"><div class="faixa-demo-in"><p><b>Cópia de segurança:</b> ${dias == null ? 'você ainda não baixou nenhuma cópia dos pedidos neste aparelho.' : `a última cópia foi há ${dias} dias.`} Baixe uma por mês e guarde no computador.</p>
+    <div class="grupo"><button class="btn btn-sm btn-sun" data-a="baixarCopia">Baixar cópia (Excel)</button></div></div></div>`;
+}
+
 /* ---------------- aplicativo (ícone na tela do celular) ---------------- */
 const CHAVE_ACESSO = 'parada_pedidos_acesso', CHAVE_SEM_FAIXA = 'parada_pedidos_sem_faixa_app';
 let pedidoInstalar = null;
@@ -3443,11 +3877,12 @@ async function entrarNoEscritorio(){
 async function iniciar(){
   const configurado = CONFIG.SUPABASE_URL.trim() && CONFIG.SUPABASE_KEY.trim();
   api = configurado ? criarApiSupabase() : criarApiDemo();
+  observarApi(api);
   S.modo = api.modo;
   const token = tokenDeAcesso();
-  if (token){ await abrirAcesso(token); return; }
+  if (token){ await abrirAcesso(token); setTimeout(vigiar, 1500); pedirTelaLigada(); return; }
   if (S.modo === 'real' && !api.sessao()){ S.vista = 'login'; render(); return; }
-  try { await entrarNoEscritorio(); }
+  try { await entrarNoEscritorio(); setTimeout(vigiar, 1500); pedirTelaLigada(); }
   catch(e) { console.error(e); S.vista = S.modo === 'real' ? 'login' : 'escritorio'; S.login.erro = e.message; render(); toast(e.message, 'erro'); }
 }
 iniciar();

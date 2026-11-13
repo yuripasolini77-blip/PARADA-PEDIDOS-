@@ -1,6 +1,6 @@
 // Parada Pedidos: deixa o sistema instalável como aplicativo.
 // Sempre busca a versão mais nova na internet; sem internet, abre a última versão guardada.
-const CACHE = 'parada-pedidos-v1';
+const CACHE = 'parada-pedidos-v2';
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
@@ -20,5 +20,15 @@ self.addEventListener('fetch', e => {
       const c = await caches.open(CACHE);
       return (await c.match('./')) || Response.error();
     }
+  })());
+});
+
+// Tocar na notificação abre o aplicativo
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  e.waitUntil((async () => {
+    const abertos = await self.clients.matchAll({type: 'window', includeUncontrolled: true});
+    for (const c of abertos) { if ('focus' in c) return c.focus(); }
+    if (self.clients.openWindow) return self.clients.openWindow('./');
   })());
 });
